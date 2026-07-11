@@ -1,12 +1,32 @@
 # Amia-plugin-group
 
-`Amia-plugin-group` 当前实际实现是 Mizuki Bot 的群聊公告管理与自动分发插件。它允许超管维护最多 5 条公告，并在群聊或私聊中其他 matcher 成功处理消息后，向尚未收到最新公告的目标自动补发一次。
+`Amia-plugin-group` 当前是 Mizuki Bot 的群公告管理与自动分发插件。
 
-仓库名虽然是 `group`，但当前代码职责并不是通用群管理框架；后续扩展前应先决定是否继续保留“公告插件”定位。
+仓库名虽然是 `group`，但当前代码并不提供完整的群管理能力；它暂时只负责维护公告、查看公告和向尚未收到最新公告的群聊或私聊补发一次。
 
-## 当前功能
+## 插件作用
 
-### 公告管理
+```text
+超级用户维护公告
+        ↓
+notices.json
+        ↓
+其他 matcher 成功处理消息
+        ↓
+run_postprocessor 检查发送历史
+        ↓
+未收到最新公告的目标补发一次
+```
+
+当前不包含：
+
+- 禁言；
+- 踢人；
+- 群成员权限管理；
+- 入群审批；
+- 完整群配置中心。
+
+## 当前指令
 
 ```text
 公告 查看
@@ -17,11 +37,11 @@
 公告 统计
 ```
 
-权限：
+当前权限：
 
-- 查看公告：所有用户。
-- 增加、修改、删除：NoneBot `SUPERUSER`。
-- 统计：当前代码未单独限制为超管，维护时应确认是否符合预期。
+- 查看公告：所有用户；
+- 增加、修改、删除：NoneBot `SUPERUSER`；
+- 公告统计：当前代码未单独限制，需要后续确认是否应公开。
 
 最多保存：
 
@@ -29,16 +49,18 @@
 5 条公告
 ```
 
-### 自动分发
+## 自动分发机制
 
-插件通过 `run_postprocessor` 在其他 matcher 成功执行后检查最新公告：
+插件通过 `run_postprocessor` 在其他 matcher 成功处理后检查最新公告：
 
 ```text
-任意指令成功处理
+任意指令成功执行
       ↓
-检查最新公告内容哈希
+读取最新公告
       ↓
-当前群/私聊是否已发送
+计算公告内容哈希
+      ↓
+检查当前目标发送历史
       ↓
 未发送则补发一次
 ```
@@ -50,7 +72,9 @@ group_<group_id>
 private_<user_id>
 ```
 
-同一最新公告在每个目标中只发送一次。
+同一个目标只会收到同一版本公告一次。公告内容发生变化后，哈希变化，目标可以再次收到新版本。
+
+公告发送失败不应影响用户原本执行的指令。
 
 ## 数据文件
 
@@ -67,67 +91,61 @@ notices.json
 sent_history.json
 ```
 
-- `notices.json` 保存公告列表。
-- `sent_history.json` 保存每个目标最后收到的公告哈希。
-- 运行数据不应提交到 Git。
+用途：
 
-## 并发处理
+- `notices.json`：公告列表；
+- `sent_history.json`：各目标最后收到的公告哈希。
+
+这些文件属于运行数据，不应提交到 Git。
+
+## 当前并发模型
 
 当前使用进程内 `_sending_lock` 防止同一目标被多个 matcher 同时触发重复发送。
 
-限制：
+该方案只适用于单进程运行：
 
-- 只在单进程内有效。
-- 多进程/多实例部署时不能保证全局唯一。
-- JSON 文件写入没有跨进程文件锁。
+- 多 Worker 之间不能共享锁；
+- 多实例之间不能保证唯一发送；
+- JSON 写入没有跨进程文件锁；
+- 进程异常退出时可能留下不完整文件。
 
-如果以后运行多个 Worker，应改用 SQLite 或共享存储，并在存储层实现唯一约束或事务锁。
+需要多进程部署时，应改用 SQLite 或共享存储，并在存储层增加事务、唯一约束和原子更新。
 
-## 当前已知风险
+## Permission 对接目标
 
-### 1. 宽泛异常吞掉
+当前增删改仍使用 `SUPERUSER`。后续应接入：
 
-当前部分代码使用裸 `except:`，会隐藏：
-
-- JSON 解析错误。
-- 文件权限问题。
-- OneBot 发送失败。
-- 代码逻辑异常。
-
-后续应改为明确异常类型并记录日志，但自动公告失败不应阻断用户原指令。
-
-### 2. 序号解析
-
-`公告 修改` 直接执行 `int()`，非法序号可能触发异常。应先校验 `isdigit()` 并给出格式提示。
-
-### 3. 公告统计口径
-
-当前统计通过：
-
-```python
-gid.startswith("group")
+```text
+group.notice.view
+group.notice.manage
+group.notice.stats
 ```
 
-计算群覆盖数，并与 `get_group_list()` 总群数比较。需要补测试确认历史文件格式与前缀一致。
+推荐调用：
 
-### 4. Plugin 名称判断
+```python
+provider = registry.get_permission_provider("static")
 
-Postprocessor 当前通过 matcher/plugin 名称排除自身。插件重命名后可能失效，建议优先比较 matcher 对象或稳定插件名。
+if provider is None:
+    allowed = False
+else:
+    result = await call_provider_safe(
+        provider.has_permission,
+        identity,
+        "group.notice.manage",
+        f"group:{event.group_id}",
+        timeout=0.5,
+    )
+    allowed = bool(result.success and result.value)
+```
 
-## 后续最小重构建议
+Provider 缺失、超时或异常时必须默认拒绝。
 
-1. 把 JSON 存储拆到 `storage.py`。
-2. 增加原子写入：临时文件写完后替换。
-3. 为管理命令拆出解析函数。
-4. 给所有文件和发送异常增加限流日志。
-5. 增加群/私聊发送策略配置。
-6. 接入 `AuditLogger("sqlite")` 记录公告增删改。
-7. 接入 PermissionProvider，逐步替换只有 `SUPERUSER` 的粗粒度权限。
-8. 再决定是否扩展为通用群基础插件。
+当前代码尚未完成这项接入，README 中的权限节点是后续开发契约，不代表已经上线。
 
-## 审计建议
+## Audit 对接目标
 
-管理操作建议记录：
+公告管理操作应写入：
 
 ```text
 group.notice.create
@@ -135,47 +153,113 @@ group.notice.update
 group.notice.delete
 ```
 
-示例目标：
+示例：
 
-```text
-notice:<index 或 hash>
+```python
+audit = registry.get_audit_logger("sqlite")
+if audit is not None:
+    await audit.log_action(
+        actor=identity,
+        action="group.notice.update",
+        target="notice:<index-or-hash>",
+        details={
+            "result": "success",
+            "before": old_summary,
+            "after": new_summary,
+        },
+    )
 ```
 
-`details` 可包含操作前后内容摘要，但不应记录不必要的用户聊天内容。
+不应把完整无关聊天内容写入审计。
 
-## 测试建议
+当前代码尚未完成 Audit 接入。
 
-至少覆盖：
+## 已确认的问题
 
-- 空公告列表。
-- 新增达到 5 条上限。
-- 非超管不能增删改。
-- 非法序号不会崩溃。
-- 同一目标同一公告只发送一次。
-- 公告内容修改后会重新发送。
-- 群聊和私聊历史相互隔离。
-- 发送失败后锁能释放。
-- JSON 损坏时安全降级并记录错误。
+### 宽泛异常捕获
+
+部分代码使用裸 `except:`，可能隐藏：
+
+- JSON 解析错误；
+- 文件权限错误；
+- OneBot 发送失败；
+- 代码逻辑异常。
+
+后续应捕获明确异常并记录限流日志，同时保持公告失败不影响原业务指令。
+
+### 序号解析
+
+`公告 修改` 等操作需要在执行 `int()` 前校验格式，非法序号必须返回提示，不能让 matcher 抛出异常。
+
+### 统计权限
+
+`公告 统计` 的访问范围尚未明确。接入 Permission 前，应先决定普通用户是否允许查看群覆盖情况。
+
+### 多进程安全
+
+当前 JSON 和进程锁方案不支持多 Worker，不能在未改存储的情况下宣称支持分布式部署。
+
+### 插件自身排除
+
+Postprocessor 通过 matcher 或插件名称排除自身时，应使用稳定标识，避免仓库或模块重命名后产生递归触发。
+
+## 推荐重构顺序
+
+1. 将 JSON 存储拆到 `storage.py`；
+2. 使用临时文件写入后原子替换；
+3. 拆出公告命令解析函数；
+4. 修复非法序号和宽泛异常捕获；
+5. 明确公告统计权限；
+6. 接入 `PermissionProvider("static")`；
+7. 接入 `AuditLogger("sqlite")`；
+8. 增加完整测试；
+9. 最后再决定是否扩展为通用群基础插件。
 
 ## 依赖
+
+当前依赖：
 
 ```text
 nonebot2
 nonebot-adapter-onebot
 ```
 
-可选后续集成：
+后续对接：
 
 ```text
 src.plugins.amia_core
-Amia-plugin-audit
 Amia-plugin-permission
+Amia-plugin-audit
 ```
+
+## 测试
+
+至少覆盖：
+
+- 空公告列表；
+- 新增达到 5 条上限；
+- 非超管不能增删改；
+- 非法序号不会崩溃；
+- 同一目标同一公告只发送一次；
+- 公告修改后重新发送；
+- 群聊和私聊历史隔离；
+- 发送失败后锁正常释放；
+- JSON 损坏时安全降级并记录错误；
+- Permission 缺失时默认拒绝；
+- Audit 可用和不可用两种情况。
+
+## 已知限制
+
+- 当前仍使用 JSON 存储；
+- 只保证单进程内的发送去重；
+- 权限仍主要依赖 `SUPERUSER`；
+- 尚未接入 Audit；
+- 不具备完整群管理能力。
 
 ## 维护边界
 
-- 不把公告历史文件提交到 Git。
-- 不在 Postprocessor 中执行耗时网络请求。
-- 不因公告发送失败影响原业务 matcher。
-- 不把本插件描述成已经具备完整群权限、禁言或成员管理能力。
+- 不提交公告运行数据；
+- 不在 Postprocessor 中执行耗时操作；
+- 不因公告发送失败影响原 matcher；
+- 不把本插件宣传成完整群管理框架；
 - 当前仓库尚未确定公开许可证。
