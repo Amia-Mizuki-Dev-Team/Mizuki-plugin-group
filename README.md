@@ -41,7 +41,7 @@ run_postprocessor 检查发送历史
 
 - 查看公告：所有用户；
 - 增加、修改、删除：NoneBot `SUPERUSER`；
-- 公告统计：当前代码未单独限制，需要后续确认是否应公开。
+- 公告统计：NoneBot `SUPERUSER`。
 
 最多保存：
 
@@ -100,13 +100,13 @@ sent_history.json
 
 ## 当前并发模型
 
-当前使用进程内 `_sending_lock` 防止同一目标被多个 matcher 同时触发重复发送。
+当前使用进程内 `_sending_lock` 防止同一目标被多个 matcher 同时触发重复发送；JSON 文件通过同目录临时文件原子替换。
 
 该方案只适用于单进程运行：
 
 - 多 Worker 之间不能共享锁；
 - 多实例之间不能保证唯一发送；
-- JSON 写入没有跨进程文件锁；
+- 原子替换不等同于跨进程锁；
 - 进程异常退出时可能留下不完整文件。
 
 需要多进程部署时，应改用 SQLite 或共享存储，并在存储层增加事务、唯一约束和原子更新。
@@ -178,7 +178,7 @@ if audit is not None:
 
 ### 宽泛异常捕获
 
-部分代码使用裸 `except:`，可能隐藏：
+文件读取只捕获可预期的 JSON/IO 异常，公告补发失败会记录目标和异常类型，不会影响原业务指令：
 
 - JSON 解析错误；
 - 文件权限错误；
@@ -193,7 +193,7 @@ if audit is not None:
 
 ### 统计权限
 
-`公告 统计` 的访问范围尚未明确。接入 Permission 前，应先决定普通用户是否允许查看群覆盖情况。
+`公告 统计` 当前使用 NoneBot `SUPERUSER`，避免向普通用户暴露全局群覆盖情况。
 
 ### 多进程安全
 
@@ -214,6 +214,13 @@ Postprocessor 通过 matcher 或插件名称排除自身时，应使用稳定标
 7. 接入 `AuditLogger("sqlite")`；
 8. 增加完整测试；
 9. 最后再决定是否扩展为通用群基础插件。
+
+## 离线测试
+
+```bash
+python -m compileall -q .
+python -m unittest discover -s tests -v
+```
 
 ## 依赖
 

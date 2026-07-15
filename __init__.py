@@ -3,12 +3,14 @@ import hashlib
 from pathlib import Path
 from typing import List, Dict, Optional, Set
 
-from nonebot import on_message, get_driver
+from nonebot import on_message, get_driver, logger
 from nonebot.adapters.onebot.v11 import Bot, MessageEvent, GroupMessageEvent
 from nonebot.permission import SUPERUSER
 from nonebot.plugin import PluginMetadata
 from nonebot.message import run_postprocessor
 from nonebot.matcher import Matcher
+
+from .storage import load_history, load_notices, save_json
 
 # --- 插件元数据 ---
 __plugin_meta__ = PluginMetadata(
@@ -26,21 +28,12 @@ __plugin_meta__ = PluginMetadata(
 
 # 路径设置
 DATA_DIR = Path("data/mizuki_notice")
-DATA_DIR.mkdir(parents=True, exist_ok=True)
 NOTICES_FILE = DATA_DIR / "notices.json"
 HISTORY_FILE = DATA_DIR / "sent_history.json"
 
 # --- 全局内存锁 (修复并发重复发送的核心) ---
 # 记录当前正在发送公告的目标 ID，防止多个插件同时触发时重复发送
 _sending_lock: Set[str] = set()
-
-def load_json(file: Path, default):
-    if not file.exists(): return default
-    try: return json.loads(file.read_text(encoding="utf-8"))
-    except: return default
-
-def save_json(file: Path, data):
-    file.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
 def get_content_hash(content: str) -> str:
     return hashlib.md5(content.encode("utf-8")).hexdigest()
@@ -53,17 +46,20 @@ async def _(bot: Bot, event: MessageEvent):
     raw_text = event.get_plaintext().strip()
     if not raw_text.startswith("公告"):
         await notice_manage.skip()
+        return
 
     parts = raw_text.split(maxsplit=2)
-    notices = load_json(NOTICES_FILE, [])
+    notices = load_notices(NOTICES_FILE)
 
     # [统计]
     if len(parts) > 1 and parts[1] == "统计":
+        if not await SUPERUSER(bot, event):
+            await notice_manage.finish("你没有权限查看公告统计。")
         if not notices: await notice_manage.finish("目前没有公告，无法统计。")
         group_list = await bot.get_group_list()
         total_groups = len(group_list)
         latest_hash = get_content_hash(notices[-1])
-        history = load_json(HISTORY_FILE, {})
+        history = load_history(HISTORY_FILE)
         sent_count = sum(1 for gid, h in history.items() if h == latest_hash and gid.startswith("group"))
         await notice_manage.finish(f"最新公告覆盖: {sent_count} / {total_groups}")
 
@@ -93,19 +89,24 @@ async def _(bot: Bot, event: MessageEvent):
 
     elif parts[1] == "修改":
         sub_parts = parts[2].split(maxsplit=1) if len(parts) > 2 else []
-        if len(sub_parts) < 2: await notice_manage.finish("格式错误")
+        if len(sub_parts) < 2 or not sub_parts[0].isdigit():
+            await notice_manage.finish("格式错误")
         idx = int(sub_parts[0]) - 1
         if 0 <= idx < len(notices):
             notices[idx] = sub_parts[1]
             save_json(NOTICES_FILE, notices)
             await notice_manage.finish(f"公告 {idx+1} 已修改。")
+        await notice_manage.finish("序号错误")
 
     elif parts[1] == "删除":
-        idx = int(parts[2]) - 1 if (len(parts) > 2 and parts[2].isdigit()) else -1
+        if len(parts) <= 2 or not parts[2].isdigit():
+            await notice_manage.finish("格式错误")
+        idx = int(parts[2]) - 1
         if 0 <= idx < len(notices):
             notices.pop(idx)
             save_json(NOTICES_FILE, notices)
             await notice_manage.finish("已删除。")
+        await notice_manage.finish("序号错误")
 
 # --- 2. 核心逻辑：自动广播钩子 ---
 @run_postprocessor
@@ -115,7 +116,7 @@ async def _(bot: Bot, event: MessageEvent, matcher: Matcher, exception: Optional
     if matcher.plugin_name == "公告" or matcher.plugin_name == "notice": return
     if matcher == notice_manage: return
 
-    notices = load_json(NOTICES_FILE, [])
+    notices = load_notices(NOTICES_FILE)
     if not notices: return
 
     latest_notice = notices[-1]
@@ -134,7 +135,7 @@ async def _(bot: Bot, event: MessageEvent, matcher: Matcher, exception: Optional
         return
 
     # 文件检查：如果以前发过，跳过
-    history = load_json(HISTORY_FILE, {})
+    history = load_history(HISTORY_FILE)
     if history.get(target_id) == latest_hash:
         return
 
@@ -148,8 +149,8 @@ async def _(bot: Bot, event: MessageEvent, matcher: Matcher, exception: Optional
         # 写入文件记录
         history[target_id] = latest_hash
         save_json(HISTORY_FILE, history)
-    except:
-        pass
+    except Exception as exc:
+        logger.warning(f"公告补发失败 target={target_id}: {exc}")
     finally:
         # [解锁] 无论成功失败，处理完后移除锁
         # 即使文件保存失败，内存锁解除了，下次还会尝试发送（符合预期）
