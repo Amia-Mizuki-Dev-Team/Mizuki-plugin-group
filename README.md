@@ -2,7 +2,7 @@
 
 `Amia-plugin-group` 当前是 Mizuki Bot 的群公告管理与自动分发插件。
 
-仓库名虽然是 `group`，但当前代码并不提供完整的群管理能力；它暂时只负责维护公告、查看公告和向尚未收到最新公告的群聊或私聊补发一次。
+仓库名虽然是 `group`，但当前代码并不提供完整的群管理能力；它只负责公告查看、增删改、统计、补发和每个目标的最新发送历史。
 
 ## 插件作用
 
@@ -49,6 +49,8 @@ run_postprocessor 检查发送历史
 5 条公告
 ```
 
+单条公告最多 2000 个字符。空白内容、超长内容和越界序号会在命令层拒绝。
+
 ## 自动分发机制
 
 插件通过 `run_postprocessor` 在其他 matcher 成功处理后检查最新公告：
@@ -68,8 +70,8 @@ run_postprocessor 检查发送历史
 目标标识：
 
 ```text
-group_<group_id>
-private_<user_id>
+group:<group_id>
+private:<user_id>
 ```
 
 同一个目标只会收到同一版本公告一次。公告内容发生变化后，哈希变化，目标可以再次收到新版本。
@@ -100,7 +102,7 @@ sent_history.json
 
 ## 当前并发模型
 
-当前使用进程内 `_sending_lock` 防止同一目标被多个 matcher 同时触发重复发送；JSON 文件通过同目录临时文件原子替换。
+当前使用进程内 `_sending_lock` 防止同一目标被多个 matcher 同时触发重复发送；JSON 文件通过同目录临时文件原子替换，成功发送后会合并最新历史文件内容再写回。
 
 该方案只适用于单进程运行：
 
@@ -174,46 +176,17 @@ if audit is not None:
 
 当前代码尚未完成 Audit 接入。
 
-## 已确认的问题
+## 本轮最终审查结论
 
-### 宽泛异常捕获
+- JSON 读取对损坏内容安全降级，写入使用同目录临时文件和原子替换；
+- 公告序号在转换前校验，非法输入返回提示，不让 matcher 抛出转换异常；
+- 统计只计算当前 Bot 群列表中的唯一群，并要求 `SUPERUSER`；
+- 自动补发失败会记录目标和异常类型，释放目标锁，不影响原 matcher；
+- 保存历史失败不会伪造“已送达”，且目标锁始终释放，下一次仍会重试；
+- 同一进程内不同目标并发补发时，历史写入会合并最新文件内容，避免互相覆盖；
+- postprocessor 通过 matcher 对象和稳定插件名排除公告插件自身。
 
-文件读取只捕获可预期的 JSON/IO 异常，公告补发失败会记录目标和异常类型，不会影响原业务指令：
-
-- JSON 解析错误；
-- 文件权限错误；
-- OneBot 发送失败；
-- 代码逻辑异常。
-
-后续应捕获明确异常并记录限流日志，同时保持公告失败不影响原业务指令。
-
-### 序号解析
-
-`公告 修改` 等操作需要在执行 `int()` 前校验格式，非法序号必须返回提示，不能让 matcher 抛出异常。
-
-### 统计权限
-
-`公告 统计` 当前使用 NoneBot `SUPERUSER`，避免向普通用户暴露全局群覆盖情况。
-
-### 多进程安全
-
-当前 JSON 和进程锁方案不支持多 Worker，不能在未改存储的情况下宣称支持分布式部署。
-
-### 插件自身排除
-
-Postprocessor 通过 matcher 或插件名称排除自身时，应使用稳定标识，避免仓库或模块重命名后产生递归触发。
-
-## 推荐重构顺序
-
-1. 将 JSON 存储拆到 `storage.py`；
-2. 使用临时文件写入后原子替换；
-3. 拆出公告命令解析函数；
-4. 修复非法序号和宽泛异常捕获；
-5. 明确公告统计权限；
-6. 接入 `PermissionProvider("static")`；
-7. 接入 `AuditLogger("sqlite")`；
-8. 增加完整测试；
-9. 最后再决定是否扩展为通用群基础插件。
+后续若需要继续演进，只限于共享事务存储、PermissionProvider 和 AuditLogger 对接；这些不属于本轮公告职责收口，也不代表本仓库应扩展为完整群管框架。
 
 ## 离线测试
 
@@ -221,6 +194,14 @@ Postprocessor 通过 matcher 或插件名称排除自身时，应使用稳定标
 python -m compileall -q .
 python -m unittest discover -s tests -v
 ```
+
+## 离线 Benchmark
+
+```bash
+python benchmarks/benchmark_storage.py --iterations 100 --targets 32
+```
+
+Benchmark 使用临时目录，只测公告发送成功后的原子 JSON 历史合并写入，不修改 `data/mizuki_notice/`，结果用于本机回归比较，不作为部署性能 SLA。
 
 ## 依赖
 
@@ -234,14 +215,14 @@ nonebot-adapter-onebot
 后续对接：
 
 ```text
-src.plugins.amia_core
+amia_core
 Amia-plugin-permission
 Amia-plugin-audit
 ```
 
 ## 测试
 
-至少覆盖：
+当前离线测试覆盖：
 
 - 空公告列表；
 - 新增达到 5 条上限；
@@ -251,9 +232,14 @@ Amia-plugin-audit
 - 公告修改后重新发送；
 - 群聊和私聊历史隔离；
 - 发送失败后锁正常释放；
-- JSON 损坏时安全降级并记录错误；
-- Permission 缺失时默认拒绝；
-- Audit 可用和不可用两种情况。
+- JSON 损坏或结构错误时安全降级；
+- 当前群列表统计与过期/私聊历史隔离；
+- 不同目标并发写历史时不互相覆盖；
+- 同目标并发补发去重；
+- 原子写入失败后不留下临时文件或半写入 JSON；
+- 公告插件自身和失败 matcher 不触发补发。
+
+PermissionProvider 与 AuditLogger 尚未接入，因此不在本轮运行测试范围内。
 
 ## 已知限制
 

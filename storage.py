@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
@@ -36,12 +37,10 @@ def save_json(file: Path, data: Any) -> None:
             handle.write("\n")
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(temp_name, file)
+        Path(temp_name).replace(file)
     except Exception:
-        try:
-            os.unlink(temp_name)
-        except FileNotFoundError:
-            pass
+        with suppress(OSError):
+            Path(temp_name).unlink()
         raise
 
 
@@ -61,3 +60,17 @@ def load_history(file: Path) -> dict[str, str]:
         for key, item in value.items()
         if isinstance(item, str)
     }
+
+
+def record_history(file: Path, target_id: str, notice_hash: str) -> None:
+    """Merge one successful send into the latest history and save it.
+
+    The read happens immediately before the atomic replacement so concurrent
+    tasks in the same event loop do not overwrite each other's target entry
+    with a stale snapshot.  This is still intentionally a single-process
+    guarantee; multi-process deployments need a shared transactional store.
+    """
+
+    history = load_history(file)
+    history[target_id] = notice_hash
+    save_json(file, history)

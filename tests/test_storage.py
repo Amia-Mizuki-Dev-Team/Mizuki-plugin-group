@@ -2,8 +2,13 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
-from storage import load_history, load_notices, save_json
+from support import add_repo_paths
+
+add_repo_paths()
+
+from storage import load_history, load_notices, record_history, save_json
 
 
 class TestNoticeStorage(unittest.TestCase):
@@ -35,10 +40,35 @@ class TestNoticeStorage(unittest.TestCase):
     def test_history_filters_non_string_values(self) -> None:
         history = self.root / "history.json"
         history.write_text(
-            json.dumps({"group_1": "hash", "group_2": 123}),
+            json.dumps({"legacy:group-1": "hash", "legacy:group-2": 123}),
             encoding="utf-8",
         )
-        self.assertEqual(load_history(history), {"group_1": "hash"})
+        self.assertEqual(load_history(history), {"legacy:group-1": "hash"})
+
+    def test_record_history_merges_latest_targets(self) -> None:
+        history = self.root / "history.json"
+        record_history(history, "group:1", "hash-1")
+        record_history(history, "private:2", "hash-2")
+        self.assertEqual(
+            load_history(history),
+            {"group:1": "hash-1", "private:2": "hash-2"},
+        )
+
+    def test_atomic_write_cleans_temp_file_after_replace_failure(self) -> None:
+        file = self.root / "notices.json"
+        with patch("storage.Path.replace", side_effect=OSError), self.assertRaises(
+            OSError
+        ):
+            save_json(file, ["notice"])
+        self.assertFalse(list(self.root.glob("*.tmp")))
+
+    def test_atomic_write_does_not_leave_partial_json(self) -> None:
+        file = self.root / "nested" / "notices.json"
+        save_json(file, ["old"])
+        with patch("storage.os.fsync", side_effect=OSError):
+            with self.assertRaises(OSError):
+                save_json(file, ["new"])
+        self.assertEqual(load_notices(file), ["old"])
 
 
 if __name__ == "__main__":
