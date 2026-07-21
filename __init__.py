@@ -1,6 +1,7 @@
 # ruff: noqa: N999 - the repository name is intentionally hyphenated.
 
 import os
+import sys
 from pathlib import Path
 from typing import Optional
 
@@ -27,6 +28,42 @@ MANAGEMENT_COMMANDS = {"增加", "修改", "删除"}
 COMMAND_PART_INDEX = 1
 ARGUMENT_PART_INDEX = 2
 MIN_UPDATE_PARTS = 2
+
+# QQ 官方 Bot 的事件 user_id 可能是 Gensokyo 会话 ID，而不是 QQ 号。
+# 允许通过环境变量扩展；当前部署的公告管理员为用户提供的 QQ 号。
+NOTICE_ADMIN_QQ_IDS = {
+    value.strip()
+    for value in os.getenv("AMIA_NOTICE_ADMIN_QQ_IDS", "2338680148").split(",")
+    if value.strip()
+}
+get_real_qq = None
+
+
+def _notice_identity_ids(event: MessageEvent) -> set[str]:
+    user_id = str(getattr(event, "user_id", ""))
+    identities = {user_id} if user_id else set()
+    resolver = get_real_qq
+    if resolver is None:
+        for module_name in ("src.plugins.qbind", "qbind"):
+            module = sys.modules.get(module_name)
+            if module is not None:
+                resolver = getattr(module, "get_real_qq", None)
+                if resolver is not None:
+                    break
+    if resolver is not None and user_id:
+        try:
+            real_qq = resolver(user_id)
+        except Exception:  # noqa: BLE001 - permission checks must fail closed
+            real_qq = None
+        if real_qq:
+            identities.add(str(real_qq))
+    return identities
+
+
+async def _is_notice_admin(bot: Bot, event: MessageEvent) -> bool:
+    if await SUPERUSER(bot, event):
+        return True
+    return bool(_notice_identity_ids(event) & NOTICE_ADMIN_QQ_IDS)
 
 # --- 插件元数据 ---
 __plugin_meta__ = PluginMetadata(
@@ -64,7 +101,7 @@ def _persist_notices(notices: list[str], operation: str) -> bool:
 
 
 async def _show_statistics(bot: Bot, event: MessageEvent) -> None:
-    if not await SUPERUSER(bot, event):
+    if not await _is_notice_admin(bot, event):
         await notice_manage.finish("你没有权限查看公告统计。")
         return
     notices = load_notices(NOTICES_FILE)
@@ -156,7 +193,10 @@ async def _delete_notice(notices: list[str], argument: str | None) -> None:
     await notice_manage.finish("已删除。")
 
 # --- 1. 公告管理指令 (管理员用) ---
-notice_manage = on_message(priority=5, block=True)
+# This matcher is intentionally broad so it can act as the announcement
+# post-processor.  It must not prevent economy/PJSK/other plugins from seeing
+# unrelated messages when ``parse_notice_command`` returns ``None``.
+notice_manage = on_message(priority=5, block=False)
 
 @notice_manage.handle()
 async def manage_notice(bot: Bot, event: MessageEvent) -> None:
@@ -185,7 +225,7 @@ async def manage_notice(bot: Bot, event: MessageEvent) -> None:
         return
 
     # --- 管理员操作 ---
-    if not await SUPERUSER(bot, event):
+    if not await _is_notice_admin(bot, event):
         await notice_manage.finish("你没有权限管理公告。")
         return
 

@@ -85,11 +85,15 @@ class TestNoticeRuntime(unittest.IsolatedAsyncioTestCase):
         self.plugin._sending_lock.clear()
         self.temp_dir.cleanup()
 
+    def test_announcement_matcher_does_not_block_unrelated_plugins(self) -> None:
+        self.assertFalse(self.plugin.notice_manage.block)
+
     async def run_command(
         self,
         text: str,
         *,
         superuser: bool = True,
+        user_id: int = 1,
         bot: FakeBot | None = None,
     ) -> str | None:
         original_superuser = self.plugin.SUPERUSER
@@ -104,7 +108,7 @@ class TestNoticeRuntime(unittest.IsolatedAsyncioTestCase):
         self.plugin.SUPERUSER = permission
         self.plugin.notice_manage.finish = finish
         try:
-            await self.handler(bot or FakeBot(), FakeEvent(text))
+            await self.handler(bot or FakeBot(), FakeEvent(text, user_id=user_id))
         except CommandFinishedError as exc:
             return exc.message
         finally:
@@ -137,6 +141,23 @@ class TestNoticeRuntime(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             await self.run_command("公告 增加 sixth"), "位置已满(5/5)"
         )
+
+    async def test_configured_real_qq_can_manage_virtual_session(self) -> None:
+        original_resolver = self.plugin.get_real_qq
+        self.plugin.get_real_qq = lambda user_id: (
+            "2338680148" if user_id == "9046299062" else None
+        )
+        try:
+            self.assertEqual(
+                await self.run_command(
+                    "公告 增加 from-real-qq",
+                    superuser=False,
+                    user_id=9046299062,
+                ),
+                "写入成功。",
+            )
+        finally:
+            self.plugin.get_real_qq = original_resolver
 
     async def test_view_edit_delete_and_unknown_command(self) -> None:
         save_json(self.notices_file, ["first", "second"])
